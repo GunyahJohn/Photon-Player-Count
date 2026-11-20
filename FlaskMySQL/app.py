@@ -1,254 +1,400 @@
-from flask import Flask, request, jsonify
-import pandas as pd
-from pymysql import converters
-import pymysql
-from mysql_config import *
-from datetime import datetime, timedelta
-import statistics
+
+import os
 import logging
-from logging.handlers import RotatingFileHandler
-import random
-
+import statistics
 import traceback
-from time import strftime
 
+from datetime import datetime, timedelta
+
+import pandas as pd
+import pymysql
+
+from flask import Flask, request, jsonify
+from pymysql import converters
 
 app = Flask(__name__)
 
-def connectToDB():
+app.logger.setLevel(logging.INFO)
 
-    conv=converters.conversions.copy()
-    conv[246]=float    # convert decimals to floats
+# Database configuration from Vercel environment variables
+MYSQL_DATABASE_HOST = os.getenv("MYSQL_DATABASE_HOST")
+MYSQL_DATABASE_USER = os.getenv("MYSQL_DATABASE_USER")
+MYSQL_DATABASE_PASSWORD = os.getenv("MYSQL_DATABASE_PASSWORD")
+MYSQL_DATABASE_DB = os.getenv("MYSQL_DATABASE_DB")
+MYSQL_DATABASE_PORT = int(os.getenv("MYSQL_DATABASE_PORT", "3306"))
+MYSQL_SSL_CA = os.getenv("MYSQL_SSL_CA")
+
+
+def connectToDB():
+    required = {
+        "MYSQL_DATABASE_HOST": MYSQL_DATABASE_HOST,
+        "MYSQL_DATABASE_USER": MYSQL_DATABASE_USER,
+        "MYSQL_DATABASE_PASSWORD": MYSQL_DATABASE_PASSWORD,
+        "MYSQL_DATABASE_DB": MYSQL_DATABASE_DB
+    }
+
+    missing = [key for key, value in required.items() if not value]
+
+    if missing:
+        raise RuntimeError(
+            "Missing database environment variables: " +
+            ", ".join(missing)
+        )
+
+    conv = converters.conversions.copy()
+    conv[246] = float
+
+    ssl_options = None
+
+    if MYSQL_SSL_CA:
+        ssl_options = {"ca": MYSQL_SSL_CA}
+
     conn = pymysql.connect(
         host=MYSQL_DATABASE_HOST,
+        port=MYSQL_DATABASE_PORT,
         user=MYSQL_DATABASE_USER,
         password=MYSQL_DATABASE_PASSWORD,
-        db=MYSQL_DATABASE_DB,
+        database=MYSQL_DATABASE_DB,
         cursorclass=pymysql.cursors.DictCursor,
-        conv=conv
+        conv=conv,
+        connect_timeout=10,
+        read_timeout=15,
+        write_timeout=15,
+        ssl=ssl_options
     )
-    curr = conn.cursor()
 
-    return conn, curr
+    return conn, conn.cursor()
+
+
+# ----------------------------------
+# UPDATE PLAYER COUNT
+# ----------------------------------
 
 @app.route('/update_monke_count', methods=["POST"])
 def update_monke_count():
 
-    if random.random() < .95:
-        return ""
+    player_count = request.values.get("player_count")
 
-    conn, curr = connectToDB()
-   
-    player_count = request.values.get('player_count')
     if player_count is None:
-        return 'No player count', 400
+        return jsonify({"error": "No player count"}), 400
 
     try:
-        data = {
-            "player_count": int(request.values.get("player_count", 0)),
-            "room_name": request.values.get("room_name", "none"),
-            "game_version": request.values.get("game_version", "none"),
-            "game_name": request.values.get("game_name", "none"),
-        }
-    except:
-        return "ur a failure"
+        player_count = int(player_count)
 
+        if player_count < 0 or player_count > 5000000:
+            return jsonify({"error": "Invalid player count"}), 400
 
-    query = """
-    INSERT INTO Monke
-    (
-        player_count,
-        room_name,
-        game_version,
-        game_name
-    )
-    VALUES
-    (
-        %(player_count)s,
-        %(room_name)s,
-        %(game_version)s,
-        %(game_name)s
-    );
-    """
-    curr.execute(query, data)
-    conn.commit()
-    curr.close()
-    return "Success"
+    except (ValueError, TypeError):
+        return jsonify({"error": "Invalid player count"}), 400
 
-@app.route('/how_many_monke_graph', methods=["GET"])
-def how_many_monke_graph():
-    hours = request.args.get('hours', 24)
-    
+    data = {
+        "player_count": player_count,
+        "room_name": request.values.get("room_name", "none"),
+        "game_version": request.values.get("game_version", "none"),
+        "game_name": request.values.get("game_name", "none")
+    }
+
+    conn = None
+
     try:
-        hours = float(hours)
-    except:
-        print("Failed to parse hours arg. Just using 24")
-        hours = 24
-    conn, curr = connectToDB()
+        conn, curr = connectToDB()
+
+        query = """
+            INSERT INTO Monke
+            (
+                player_count,
+                room_name,
+                game_version,
+                game_name
+            )
+            VALUES
+            (
+                %(player_count)s,
+                %(room_name)s,
+                %(game_version)s,
+                %(game_name)s
+            )
+        """
+
+        curr.execute(query, data)
+        conn.commit()
+
+        app.logger.info(
+            "Player count updated: %s",
+            player_count
+        )
+
+        return jsonify({
+            "success": True,
+            "player_count": player_count
+        })
+
+    except Exception:
+        app.logger.exception("Failed to update player count")
+        return jsonify({"error": "Database error"}), 500
+
+    finally:
+        if conn:
+            conn.close()
 
 
-    old_hours = []
-
-    # this is the fractional hour up until now
-    last_hour = datetime.utcnow().replace(microsecond=0, second=0, minute=0)
-
-    # calculate the new number of hours from this time to the beginning
-    start_time = datetime.utcnow() - timedelta(hours=hours)
-
-    for i in range(0, int((last_hour - start_time).total_seconds() / 3600)):
-        old_hours.append(last_hour - timedelta(hours=i+1))
-        
-    # also add the last fractional bit.
-    old_hours.append(start_time)
-    old_hours = list(set(old_hours))
-
-    all_data = []
-    for old_hour in old_hours:
-        all_data.extend(get_data_from_hour(old_hour, conn, curr, True))
-        
-    # get the rest of the recent data without cache
-    all_data.extend(get_data_from_hour(last_hour, conn, curr, False))
-
-    all_data = sorted(all_data, key=lambda t: t['timestamp'])
-
-    num_values = 1024
-    if len(all_data) > num_values:
-        all_data = all_data[::int(len(all_data)/num_values)]
-
-    conn.commit()
-    curr.close()
-
-    return jsonify(all_data)
-
-
-def get_data_from_hour(hour_timestamp, conn, curr, should_add_to_cache: bool) -> list:
-
-    start = hour_timestamp.isoformat()
-    end = (hour_timestamp.replace(microsecond=0, second=0, minute=0) + timedelta(hours=1)).isoformat()
-
-    # fstring not safe, but ok since generated by us
-    query = f"""
-    SELECT `timestamp`, `player_count`
-    FROM `Cache`
-    WHERE `timestamp` > "{start}"
-    AND `timestamp` < "{end}"
-    AND `player_count` < 5000000
-    ORDER BY `timestamp` DESC;
-    """
-    curr.execute(query)
-    output = [dict(row) for row in curr.fetchall()]
-
-    # cache hit
-    if len(output) != 0:
-        return output
-
-        
-    # cache miss
-    # fetch from big boy database
-    query = f"""
-    SELECT `timestamp`, `player_count`
-    FROM `Monke`
-    WHERE `timestamp` > '{start}'
-    AND `player_count` < 5000000
-    AND `timestamp` < '{end}'
-    ORDER BY `timestamp` DESC;
-    """
-    curr.execute(query)
-    output = [dict(row) for row in curr.fetchall()]
-
-    if len(output) == 0:
-        return output
-    
-    df = pd.DataFrame(output)
-    df.columns = ['timestamp', 'player_count']
-    df['player_count'] = pd.to_numeric(df['player_count'], errors='coerce')
-    df = df.dropna()
-    df = df.astype({'player_count': 'int32'})
-    length = 500
-    df['player_count'] = df['player_count'].rolling(int(length + 1)).median().shift(int(-length/2))
-    for i in range (0, 2):
-        df = df[df['player_count'] > df['player_count'].shift(-1) - 100]
-        df = df[df['player_count'] < df['player_count'].shift(-1) + 100]
-    output = df.to_dict('records')
-
-    output = output[::max(1,int(len(output)/30))]
-
-    if should_add_to_cache:
-        add_to_cache(output, conn, curr)
-        
-    return output
-
+# ----------------------------------
+# GET CURRENT PLAYER COUNT
+# ----------------------------------
 
 @app.route('/how_many_monke', methods=["GET"])
 def how_many_monke():
-    conn, curr = connectToDB()
 
-    query = """
-    SELECT `player_count`
-    FROM `Monke`
-    ORDER BY `timestamp` DESC
-    LIMIT 200;
-    """
-    curr.execute(query)
-    most_recent_update = [dict(row)['player_count'] for row in curr.fetchall()]
-    conn.close()
-    median = round(statistics.median(most_recent_update))
+    conn = None
 
-    return jsonify(median)
-    
+    try:
+        conn, curr = connectToDB()
+
+        curr.execute("""
+            SELECT player_count
+            FROM Monke
+            ORDER BY timestamp DESC
+            LIMIT 200
+        """)
+
+        results = curr.fetchall()
+
+        counts = [
+            row["player_count"]
+            for row in results
+        ]
+
+        if not counts:
+            return jsonify(0)
+
+        median = round(statistics.median(counts))
+
+        return jsonify(median)
+
+    except Exception:
+        app.logger.exception("Failed to retrieve player count")
+        return jsonify({"error": "Database error"}), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# ----------------------------------
+# CACHE FUNCTIONS
+# ----------------------------------
 
 def add_to_cache(data, conn, curr):
+
     query = """
-    INSERT INTO `Cache`
-    (
-        `timestamp`,
-        `player_count`
-    )
-    VALUES
-    (
-        %(timestamp)s,
-        %(player_count)s
-    );
+        INSERT INTO Cache
+        (
+            timestamp,
+            player_count
+        )
+        VALUES
+        (
+            %(timestamp)s,
+            %(player_count)s
+        )
     """
+
     for row in data:
         curr.execute(query, row)
-    return "Success"
 
 
+def get_data_from_hour(hour_timestamp, conn, curr,
+                       should_add_to_cache):
 
-handler = RotatingFileHandler('app.log', maxBytes=100000000, backupCount=1500)
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.ERROR)
-logger.addHandler(handler)
+    start = hour_timestamp
 
-#@app.after_request
-#def after_request(response):
-#    """ Logging after every request. """
-    # This avoids the duplication of registry in the log,
-    # since that 500 is already logged via @app.errorhandler.
-#    if response.status_code != 500:
-#        ts = strftime('[%Y-%b-%d %H:%M]')
-#        logger.error('%s %s %s %s %s %s',
-#                     ts,
-#                     request.remote_addr,
-#                     request.method,
-#                     request.scheme,
-#                     request.full_path,
-#                     response.status)
-#    return response
+    end = hour_timestamp.replace(
+        minute=0,
+        second=0,
+        microsecond=0
+    ) + timedelta(hours=1)
+
+    query = """
+        SELECT timestamp, player_count
+        FROM Cache
+        WHERE timestamp > %s
+        AND timestamp < %s
+        AND player_count < 5000000
+        ORDER BY timestamp DESC
+    """
+
+    curr.execute(query, (start, end))
+    output = curr.fetchall()
+
+    if output:
+        return output
+
+    query = """
+        SELECT timestamp, player_count
+        FROM Monke
+        WHERE timestamp > %s
+        AND timestamp < %s
+        AND player_count < 5000000
+        ORDER BY timestamp DESC
+    """
+
+    curr.execute(query, (start, end))
+    output = curr.fetchall()
+
+    if not output:
+        return []
+
+    df = pd.DataFrame(output)
+
+    df["player_count"] = pd.to_numeric(
+        df["player_count"],
+        errors="coerce"
+    )
+
+    df = df.dropna()
+
+    if df.empty:
+        return []
+
+    df["player_count"] = df["player_count"].astype("int32")
+
+    length = 500
+
+    df["player_count"] = (
+        df["player_count"]
+        .rolling(length + 1)
+        .median()
+        .shift(-(length // 2))
+    )
+
+    for _ in range(2):
+        df = df[
+            df["player_count"] >
+            df["player_count"].shift(-1) - 100
+        ]
+
+        df = df[
+            df["player_count"] <
+            df["player_count"].shift(-1) + 100
+        ]
+
+    df = df.dropna()
+
+    output = df.to_dict("records")
+
+    output = output[::max(1, len(output) // 30)]
+
+    if should_add_to_cache and output:
+        add_to_cache(output, conn, curr)
+
+    return output
+
+
+# ----------------------------------
+# PLAYER COUNT GRAPH
+# ----------------------------------
+
+@app.route('/how_many_monke_graph', methods=["GET"])
+def how_many_monke_graph():
+
+    try:
+        hours = float(request.args.get("hours", 24))
+
+        if not 0 < hours <= 720:
+            return jsonify({"error": "Hours must be between 0 and 720"}), 400
+
+    except (ValueError, TypeError):
+        hours = 24
+
+    conn = None
+
+    try:
+        conn, curr = connectToDB()
+
+        now = datetime.utcnow()
+
+        last_hour = now.replace(
+            minute=0,
+            second=0,
+            microsecond=0
+        )
+
+        start_time = now - timedelta(hours=hours)
+
+        old_hours = []
+        current = last_hour
+
+        while current > start_time:
+            current -= timedelta(hours=1)
+            old_hours.append(current)
+
+        old_hours.append(start_time)
+
+        all_data = []
+
+        for old_hour in set(old_hours):
+            all_data.extend(
+                get_data_from_hour(
+                    old_hour,
+                    conn,
+                    curr,
+                    True
+                )
+            )
+
+        all_data.extend(
+            get_data_from_hour(
+                last_hour,
+                conn,
+                curr,
+                False
+            )
+        )
+
+        all_data.sort(
+            key=lambda row: row["timestamp"]
+        )
+
+        num_values = 1024
+
+        if len(all_data) > num_values:
+            step = max(1, len(all_data) // num_values)
+            all_data = all_data[::step]
+
+        conn.commit()
+
+        return jsonify(all_data)
+
+    except Exception:
+        app.logger.exception("Failed to retrieve graph")
+        return jsonify({"error": "Graph database error"}), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# ----------------------------------
+# HEALTH CHECK
+# ----------------------------------
+
+@app.route('/', methods=["GET"])
+def home():
+    return jsonify({
+        "status": "online",
+        "service": "Gunyahs Gorilla Horror Player Count API"
+    })
 
 
 @app.errorhandler(Exception)
-def exceptions(e):
-    """ Logging after every Exception. """
-    ts = strftime('[%Y-%b-%d %H:%M]')
-    tb = traceback.format_exc()
-    logger.error('%s %s %s %s %s 5xx INTERNAL SERVER ERROR\n%s',
-                 ts,
-                 request.remote_addr,
-                 request.method,
-                 request.scheme,
-                 request.full_path,
-                 tb)
+def exceptions(error):
 
-    return "SERVER ERROR", 500
+    app.logger.error(
+        "Unhandled error: %s\n%s",
+        error,
+        traceback.format_exc()
+    )
+
+    return jsonify({
+        "error": "Internal server error"
+    }), 500
