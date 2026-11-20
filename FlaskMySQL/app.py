@@ -2,103 +2,220 @@
 import os
 import logging
 import statistics
-import traceback
-
 from datetime import datetime, timedelta
 
-import pandas as pd
 import pymysql
 
 from flask import Flask, request, jsonify
 from pymysql import converters
+from werkzeug.exceptions import HTTPException
+
 
 app = Flask(__name__)
-
 app.logger.setLevel(logging.INFO)
 
-# Database configuration from Vercel environment variables
+
+# ============================================================
+# DATABASE CONFIGURATION
+# ============================================================
+
 MYSQL_DATABASE_HOST = os.getenv("MYSQL_DATABASE_HOST")
 MYSQL_DATABASE_USER = os.getenv("MYSQL_DATABASE_USER")
 MYSQL_DATABASE_PASSWORD = os.getenv("MYSQL_DATABASE_PASSWORD")
 MYSQL_DATABASE_DB = os.getenv("MYSQL_DATABASE_DB")
-MYSQL_DATABASE_PORT = int(os.getenv("MYSQL_DATABASE_PORT", "3306"))
-MYSQL_SSL_CA = os.getenv("MYSQL_SSL_CA")
+
+# TiDB Cloud Starter normally uses port 4000.
+MYSQL_DATABASE_PORT = int(
+    os.getenv("MYSQL_DATABASE_PORT", "4000")
+)
+
+# Use MYSQL_SSL_CA if supplied; otherwise look for ca.pem
+# beside this app.py file.
+MYSQL_SSL_CA = os.getenv(
+    "MYSQL_SSL_CA",
+    os.path.join(os.path.dirname(__file__), "ca.pem")
+)
 
 
 def connectToDB():
+
+    required = {
+        "MYSQL_DATABASE_HOST": MYSQL_DATABASE_HOST,
+        "MYSQL_DATABASE_USER": MYSQL_DATABASE_USER,
+        "MYSQL_DATABASE_PASSWORD": MYSQL_DATABASE_PASSWORD,
+        "MYSQL_DATABASE_DB": MYSQL_DATABASE_DB
+    }
+
+    missing = [
+        name for name, value in required.items()
+        if not value
+    ]
+
+    if missing:
+        raise RuntimeError(
+            "Missing database environment variables: "
+            + ", ".join(missing)
+        )
+
+    if not os.path.isfile(MYSQL_SSL_CA):
+        raise RuntimeError(
+            "TiDB CA certificate not found. "
+            "Expected file at: " + MYSQL_SSL_CA
+        )
+
     conv = converters.conversions.copy()
     conv[246] = float
 
     conn = pymysql.connect(
         host=MYSQL_DATABASE_HOST,
-        port=4000,
+        port=MYSQL_DATABASE_PORT,
         user=MYSQL_DATABASE_USER,
         password=MYSQL_DATABASE_PASSWORD,
         database=MYSQL_DATABASE_DB,
         cursorclass=pymysql.cursors.DictCursor,
         conv=conv,
         connect_timeout=10,
+        read_timeout=15,
+        write_timeout=15,
+        autocommit=False,
         ssl={
-            "ca": os.path.join(
-                os.path.dirname(__file__),
-                "ca.pem"
-            ),
+            "ca": MYSQL_SSL_CA,
             "check_hostname": True
         }
     )
 
-    return conn, conn.cursor()
-# ----------------------------------
-# UPDATE PLAYER COUNT
-# ----------------------------------
+    return conn
 
-@app.route('/update_monke_count', methods=["POST"])
-def update_monke_count():
 
-    player_count = request.values.get("player_count")
+# ============================================================
+# REQUEST HELPERS
+# ============================================================
 
-    if player_count is None:
-        return jsonify({"error": "No player count"}), 400
+def get_request_data():
 
-    try:
-        player_count = int(player_count)
+    json_data = request.get_json(silent=True)
 
-        if player_count < 0 or player_count > 5000000:
-            return jsonify({"error": "Invalid player count"}), 400
+    if isinstance(json_data, dict):
+        return json_data
 
-    except (ValueError, TypeError):
-        return jsonify({"error": "Invalid player count"}), 400
+    return request.values
 
-    data = {
-        "player_count": player_count,
-        "room_name": request.values.get("room_name", "none"),
-        "game_version": request.values.get("game_version", "none"),
-        "game_name": request.values.get("game_name", "none")
-    }
+
+def error_response(message, status=400):
+    return jsonify({
+        "success": False,
+        "error": message
+    }), status
+
+
+# ============================================================
+# HOME / HEALTH CHECK
+# ============================================================
+
+@app.route("/", methods=["GET"])
+def home():
+
+    return jsonify({
+        "status": "online",
+        "service": "Gunyahs Gorilla Horror Player Count API",
+        "endpoints": [
+            "/update_monke_count",
+            "/how_many_monke",
+            "/how_many_monke_graph"
+        ]
+    })
+
+
+@app.route("/health/db", methods=["GET"])
+def database_health():
 
     conn = None
 
     try:
-        conn, curr = connectToDB()
+        conn = connectToDB()
 
-        query = """
-            INSERT INTO Monke
-            (
-                player_count,
-                room_name,
-                game_version,
-                game_name
-            )
-            VALUES
-            (
-                %(player_count)s,
-                %(room_name)s,
-                %(game_version)s,
-                %(game_name)s
-            )
-        """
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT 1 AS result")
+            result = cursor.fetchone()
 
-        curr.execute(query, data)
+        return jsonify({
+            "status": "online",
+            "database": "connected",
+            "test": result["result"]
+        })
+
+    except Exception:
+        app.logger.exception("Database health check failed")
+
+        return jsonify({
+            "status": "error",
+            "database": "unavailable"
+        }), 500
+
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# UPDATE PLAYER COUNT
+# ============================================================
+
+@app.route("/update_monke_count", methods=["POST"])
+def update_monke_count():
+
+    data = get_request_data()
+
+    raw_count = data.get("player_count")
+
+    if raw_count is None:
+        return error_response("No player count supplied")
+
+    try:
+        player_count = int(raw_count)
+
+    except (ValueError, TypeError, OverflowError):
+        return error_response("Invalid player count")
+
+    if not 0 <= player_count <= 5000000:
+        return error_response("Player count is out of range")
+
+    room_name = str(data.get("room_name", "none"))[:255]
+    game_version = str(data.get("game_version", "none"))[:100]
+    game_name = str(data.get("game_name", "none"))[:255]
+
+    conn = None
+
+    try:
+        conn = connectToDB()
+
+        with conn.cursor() as cursor:
+
+            cursor.execute(
+                """
+                INSERT INTO Monke
+                (
+                    player_count,
+                    room_name,
+                    game_version,
+                    game_name
+                )
+                VALUES
+                (
+                    %s,
+                    %s,
+                    %s,
+                    %s
+                )
+                """,
+                (
+                    player_count,
+                    room_name,
+                    game_version,
+                    game_name
+                )
+            )
+
         conn.commit()
 
         app.logger.info(
@@ -112,42 +229,53 @@ def update_monke_count():
         })
 
     except Exception:
+        if conn:
+            conn.rollback()
+
         app.logger.exception("Failed to update player count")
-        return jsonify({"error": "Database error"}), 500
+
+        return jsonify({
+            "success": False,
+            "error": "Database error"
+        }), 500
 
     finally:
         if conn:
             conn.close()
 
 
-# ----------------------------------
+# ============================================================
 # GET CURRENT PLAYER COUNT
-# ----------------------------------
+# ============================================================
 
-@app.route('/how_many_monke', methods=["GET"])
+@app.route("/how_many_monke", methods=["GET"])
 def how_many_monke():
 
     conn = None
 
     try:
-        conn, curr = connectToDB()
+        conn = connectToDB()
 
-        curr.execute("""
-            SELECT player_count
-            FROM Monke
-            ORDER BY timestamp DESC
-            LIMIT 200
-        """)
+        with conn.cursor() as cursor:
 
-        results = curr.fetchall()
+            cursor.execute(
+                """
+                SELECT player_count
+                FROM Monke
+                ORDER BY timestamp DESC
+                LIMIT 200
+                """
+            )
+
+            results = cursor.fetchall()
+
+        if not results:
+            return jsonify(0)
 
         counts = [
-            row["player_count"]
+            int(row["player_count"])
             for row in results
         ]
-
-        if not counts:
-            return jsonify(0)
 
         median = round(statistics.median(counts))
 
@@ -155,226 +283,112 @@ def how_many_monke():
 
     except Exception:
         app.logger.exception("Failed to retrieve player count")
-        return jsonify({"error": "Database error"}), 500
+
+        return jsonify({
+            "error": "Database error"
+        }), 500
 
     finally:
         if conn:
             conn.close()
 
 
-# ----------------------------------
-# CACHE FUNCTIONS
-# ----------------------------------
-
-def add_to_cache(data, conn, curr):
-
-    query = """
-        INSERT INTO Cache
-        (
-            timestamp,
-            player_count
-        )
-        VALUES
-        (
-            %(timestamp)s,
-            %(player_count)s
-        )
-    """
-
-    for row in data:
-        curr.execute(query, row)
-
-
-def get_data_from_hour(hour_timestamp, conn, curr,
-                       should_add_to_cache):
-
-    start = hour_timestamp
-
-    end = hour_timestamp.replace(
-        minute=0,
-        second=0,
-        microsecond=0
-    ) + timedelta(hours=1)
-
-    query = """
-        SELECT timestamp, player_count
-        FROM Cache
-        WHERE timestamp > %s
-        AND timestamp < %s
-        AND player_count < 5000000
-        ORDER BY timestamp DESC
-    """
-
-    curr.execute(query, (start, end))
-    output = curr.fetchall()
-
-    if output:
-        return output
-
-    query = """
-        SELECT timestamp, player_count
-        FROM Monke
-        WHERE timestamp > %s
-        AND timestamp < %s
-        AND player_count < 5000000
-        ORDER BY timestamp DESC
-    """
-
-    curr.execute(query, (start, end))
-    output = curr.fetchall()
-
-    if not output:
-        return []
-
-    df = pd.DataFrame(output)
-
-    df["player_count"] = pd.to_numeric(
-        df["player_count"],
-        errors="coerce"
-    )
-
-    df = df.dropna()
-
-    if df.empty:
-        return []
-
-    df["player_count"] = df["player_count"].astype("int32")
-
-    length = 500
-
-    df["player_count"] = (
-        df["player_count"]
-        .rolling(length + 1)
-        .median()
-        .shift(-(length // 2))
-    )
-
-    for _ in range(2):
-        df = df[
-            df["player_count"] >
-            df["player_count"].shift(-1) - 100
-        ]
-
-        df = df[
-            df["player_count"] <
-            df["player_count"].shift(-1) + 100
-        ]
-
-    df = df.dropna()
-
-    output = df.to_dict("records")
-
-    output = output[::max(1, len(output) // 30)]
-
-    if should_add_to_cache and output:
-        add_to_cache(output, conn, curr)
-
-    return output
-
-
-# ----------------------------------
+# ============================================================
 # PLAYER COUNT GRAPH
-# ----------------------------------
+# ============================================================
 
-@app.route('/how_many_monke_graph', methods=["GET"])
+@app.route("/how_many_monke_graph", methods=["GET"])
 def how_many_monke_graph():
 
     try:
         hours = float(request.args.get("hours", 24))
 
-        if not 0 < hours <= 720:
-            return jsonify({"error": "Hours must be between 0 and 720"}), 400
-
     except (ValueError, TypeError):
-        hours = 24
+        return error_response("Invalid hours parameter")
+
+    if not 0 < hours <= 720:
+        return error_response(
+            "Hours must be between 0 and 720"
+        )
 
     conn = None
 
     try:
-        conn, curr = connectToDB()
+        conn = connectToDB()
 
-        now = datetime.utcnow()
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=hours)
 
-        last_hour = now.replace(
-            minute=0,
-            second=0,
-            microsecond=0
-        )
+        with conn.cursor() as cursor:
 
-        start_time = now - timedelta(hours=hours)
-
-        old_hours = []
-        current = last_hour
-
-        while current > start_time:
-            current -= timedelta(hours=1)
-            old_hours.append(current)
-
-        old_hours.append(start_time)
-
-        all_data = []
-
-        for old_hour in set(old_hours):
-            all_data.extend(
-                get_data_from_hour(
-                    old_hour,
-                    conn,
-                    curr,
-                    True
-                )
+            cursor.execute(
+                """
+                SELECT timestamp, player_count
+                FROM Monke
+                WHERE timestamp >= %s
+                  AND timestamp <= %s
+                  AND player_count >= 0
+                  AND player_count <= 5000000
+                ORDER BY timestamp ASC
+                """,
+                (start_time, end_time)
             )
 
-        all_data.extend(
-            get_data_from_hour(
-                last_hour,
-                conn,
-                curr,
-                False
-            )
-        )
+            results = cursor.fetchall()
 
-        all_data.sort(
-            key=lambda row: row["timestamp"]
-        )
+        # Return an empty graph if there are no records.
+        if not results:
+            return jsonify([])
 
-        num_values = 1024
+        # Convert database rows into JSON-friendly dictionaries.
+        all_data = [
+            {
+                "timestamp": row["timestamp"].isoformat()
+                if row["timestamp"] else None,
+                "player_count": int(row["player_count"])
+            }
+            for row in results
+        ]
 
-        if len(all_data) > num_values:
-            step = max(1, len(all_data) // num_values)
-            all_data = all_data[::step]
+        # Keep the graph response at or below 1024 points.
+        max_points = 1024
 
-        conn.commit()
+        if len(all_data) > max_points:
+
+            step = (len(all_data) - 1) / (max_points - 1)
+
+            all_data = [
+                all_data[round(i * step)]
+                for i in range(max_points)
+            ]
 
         return jsonify(all_data)
 
     except Exception:
-        app.logger.exception("Failed to retrieve graph")
-        return jsonify({"error": "Graph database error"}), 500
+        app.logger.exception("Failed to retrieve player count graph")
+
+        return jsonify({
+            "error": "Graph database error"
+        }), 500
 
     finally:
         if conn:
             conn.close()
 
 
-# ----------------------------------
-# HEALTH CHECK
-# ----------------------------------
-
-@app.route('/', methods=["GET"])
-def home():
-    return jsonify({
-        "status": "online",
-        "service": "Gunyahs Gorilla Horror Player Count API"
-    })
-
+# ============================================================
+# ERROR HANDLING
+# ============================================================
 
 @app.errorhandler(Exception)
-def exceptions(error):
+def handle_errors(error):
 
-    app.logger.error(
-        "Unhandled error: %s\n%s",
-        error,
-        traceback.format_exc()
+    if isinstance(error, HTTPException):
+        return error
+
+    app.logger.exception(
+        "Unhandled error on %s",
+        request.path
     )
 
     return jsonify({
