@@ -26,46 +26,28 @@ MYSQL_SSL_CA = os.getenv("MYSQL_SSL_CA")
 
 
 def connectToDB():
-    required = {
-        "MYSQL_DATABASE_HOST": MYSQL_DATABASE_HOST,
-        "MYSQL_DATABASE_USER": MYSQL_DATABASE_USER,
-        "MYSQL_DATABASE_PASSWORD": MYSQL_DATABASE_PASSWORD,
-        "MYSQL_DATABASE_DB": MYSQL_DATABASE_DB
-    }
-
-    missing = [key for key, value in required.items() if not value]
-
-    if missing:
-        raise RuntimeError(
-            "Missing database environment variables: " +
-            ", ".join(missing)
-        )
-
     conv = converters.conversions.copy()
     conv[246] = float
 
-    ssl_options = None
-
-    if MYSQL_SSL_CA:
-        ssl_options = {"ca": MYSQL_SSL_CA}
-
     conn = pymysql.connect(
         host=MYSQL_DATABASE_HOST,
-        port=MYSQL_DATABASE_PORT,
+        port=4000,
         user=MYSQL_DATABASE_USER,
         password=MYSQL_DATABASE_PASSWORD,
         database=MYSQL_DATABASE_DB,
         cursorclass=pymysql.cursors.DictCursor,
         conv=conv,
         connect_timeout=10,
-        read_timeout=15,
-        write_timeout=15,
-        ssl=ssl_options
+        ssl={
+            "ca": os.path.join(
+                os.path.dirname(__file__),
+                "ca.pem"
+            ),
+            "check_hostname": True
+        }
     )
 
     return conn, conn.cursor()
-
-
 # ----------------------------------
 # UPDATE PLAYER COUNT
 # ----------------------------------
